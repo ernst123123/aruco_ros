@@ -65,10 +65,12 @@ private:
   ros::NodeHandle nh_;
   image_transport::ImageTransport it_;
   image_transport::Subscriber image_sub_;
-
+  
   image_transport::Publisher image_pub_;
   image_transport::Publisher debug_pub_;
   ros::Publisher marker_pub_;
+  ros::Publisher position_pub_;
+
   ros::Publisher marker_list_pub_;
   tf::TransformListener tfListener_;
 
@@ -104,8 +106,9 @@ public:
     }
 
     image_pub_ = it_.advertise("result", 1);
+    position_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("position_from_marker", 10);
     debug_pub_ = it_.advertise("debug", 1);
-    marker_pub_ = nh_.advertise<aruco_msgs::MarkerArray>("markers", 1);
+    marker_pub_ = nh_.advertise<aruco_msgs::MarkerArray>("markers", 100);
     marker_list_pub_ = nh_.advertise<std_msgs::UInt32MultiArray>("markers_list", 10);
 
     marker_msg_ = aruco_msgs::MarkerArray::Ptr(new aruco_msgs::MarkerArray());
@@ -141,122 +144,150 @@ public:
   }
 
   void image_callback(const sensor_msgs::ImageConstPtr& msg)
-  {
+{
     bool publishMarkers = marker_pub_.getNumSubscribers() > 0;
     bool publishMarkersList = marker_list_pub_.getNumSubscribers() > 0;
     bool publishImage = image_pub_.getNumSubscribers() > 0;
     bool publishDebug = debug_pub_.getNumSubscribers() > 0;
+    bool publishPosition = position_pub_.getNumSubscribers() > 0;
 
-    if (!publishMarkers && !publishMarkersList && !publishImage && !publishDebug)
-      return;
+    if (!publishMarkers && !publishMarkersList && !publishImage && !publishDebug && !publishPosition)
+        return;
 
     ros::Time curr_stamp = msg->header.stamp;
     cv_bridge::CvImagePtr cv_ptr;
+
     try
     {
-      cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::RGB8);
-      inImage_ = cv_ptr->image;
+        cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::RGB8);
+        inImage_ = cv_ptr->image;
 
-      // clear out previous detection results
-      markers_.clear();
+        // clear out previous detection results
+        markers_.clear();
 
-      // ok, let's detect
-      mDetector_.detect(inImage_, markers_, camParam_, marker_size_, false);
+        // ok, let's detect
+        mDetector_.detect(inImage_, markers_, camParam_, marker_size_, false);
 
-      // marker array publish
-      if (publishMarkers)
-      {
-        marker_msg_->markers.clear();
-        marker_msg_->markers.resize(markers_.size());
-        marker_msg_->header.stamp = curr_stamp;
-        marker_msg_->header.seq++;
-
-        for (std::size_t i = 0; i < markers_.size(); ++i)
+        // marker array publish
+        if (publishMarkers)
         {
-          aruco_msgs::Marker & marker_i = marker_msg_->markers.at(i);
-          marker_i.header.stamp = curr_stamp;
-          marker_i.id = markers_.at(i).id;
-          marker_i.confidence = 1.0;
+            marker_msg_->markers.clear();
+            marker_msg_->markers.resize(markers_.size());
+            marker_msg_->header.stamp = curr_stamp;
+            marker_msg_->header.seq++;
+
+            for (std::size_t i = 0; i < markers_.size(); ++i)
+            {
+                aruco_msgs::Marker & marker_i = marker_msg_->markers.at(i);
+                marker_i.header.stamp = curr_stamp;
+                marker_i.id = markers_.at(i).id;
+                marker_i.confidence = 1.0;
+            }
+
+            // if there is camera info let's do 3D stuff
+            if (useCamInfo_)
+            {
+                // get the current transform from the camera frame to output ref frame
+                tf::StampedTransform cameraToReference;
+                cameraToReference.setIdentity();
+
+                if (reference_frame_ != camera_frame_)
+                {
+                    getTransform(reference_frame_, camera_frame_, cameraToReference);
+                }
+
+                // now find the transform for each detected marker
+                for (std::size_t i = 0; i < markers_.size(); ++i)
+                {
+                    aruco_msgs::Marker & marker_i = marker_msg_->markers.at(i);
+                    tf::Transform transform = aruco_ros::arucoMarker2Tf(markers_[i]);
+                    transform = static_cast<tf::Transform>(cameraToReference) * transform;
+                    tf::poseTFToMsg(transform, marker_i.pose.pose);
+                    marker_i.header.frame_id = reference_frame_;
+                }
+            }
+
+            // publish marker array
+            if (marker_msg_->markers.size() > 0)
+                marker_pub_.publish(marker_msg_);
         }
 
-        // if there is camera info let's do 3D stuff
-        if (useCamInfo_)
+        if (publishMarkersList)
         {
-          // get the current transform from the camera frame to output ref frame
-          tf::StampedTransform cameraToReference;
-          cameraToReference.setIdentity();
+            marker_list_msg_.data.resize(markers_.size());
+            for (std::size_t i = 0; i < markers_.size(); ++i)
+                marker_list_msg_.data[i] = markers_[i].id;
 
-          if (reference_frame_ != camera_frame_)
-          {
-            getTransform(reference_frame_, camera_frame_, cameraToReference);
-          }
-
-          // now find the transform for each detected marker
-          for (std::size_t i = 0; i < markers_.size(); ++i)
-          {
-            aruco_msgs::Marker & marker_i = marker_msg_->markers.at(i);
-            tf::Transform transform = aruco_ros::arucoMarker2Tf(markers_[i]);
-            transform = static_cast<tf::Transform>(cameraToReference) * transform;
-            tf::poseTFToMsg(transform, marker_i.pose.pose);
-            marker_i.header.frame_id = reference_frame_;
-          }
+            marker_list_pub_.publish(marker_list_msg_);
         }
 
-        // publish marker array
-        if (marker_msg_->markers.size() > 0)
-          marker_pub_.publish(marker_msg_);
-      }
-
-      if (publishMarkersList)
-      {
-        marker_list_msg_.data.resize(markers_.size());
+        // draw detected markers on the image for visualization
         for (std::size_t i = 0; i < markers_.size(); ++i)
-          marker_list_msg_.data[i] = markers_[i].id;
+        {
+            markers_[i].draw(inImage_, cv::Scalar(0, 0, 255), 2);
+        }
 
-        marker_list_pub_.publish(marker_list_msg_);
-      }
+        // draw a 3D cube in each marker if there is 3D info
+        if (camParam_.isValid() && marker_size_ != -1)
+        {
+            for (std::size_t i = 0; i < markers_.size(); ++i)
+                aruco::CvDrawingUtils::draw3dAxis(inImage_, markers_[i], camParam_);
+        }
 
-      // draw detected markers on the image for visualization
-      for (std::size_t i = 0; i < markers_.size(); ++i)
-      {
-        markers_[i].draw(inImage_, cv::Scalar(0, 0, 255), 2);
-      }
+        // publish input image with markers drawn on it
+        if (publishImage)
+        {
+            // show input with augmented information
+            cv_bridge::CvImage out_msg;
+            out_msg.header.stamp = curr_stamp;
+            out_msg.encoding = sensor_msgs::image_encodings::RGB8;
+            out_msg.image = inImage_;
+            image_pub_.publish(out_msg.toImageMsg());
+        }
 
-      // draw a 3D cube in each marker if there is 3D info
-      if (camParam_.isValid() && marker_size_ != -1)
-      {
-        for (std::size_t i = 0; i < markers_.size(); ++i)
-          aruco::CvDrawingUtils::draw3dAxis(inImage_, markers_[i], camParam_);
-      }
+        // publish image after internal image processing
+        if (publishDebug)
+        {
+            // show also the internal image resulting from the threshold operation
+            cv_bridge::CvImage debug_msg;
+            debug_msg.header.stamp = curr_stamp;
+            debug_msg.encoding = sensor_msgs::image_encodings::MONO8;
+            debug_msg.image = mDetector_.getThresholdedImage();
+            debug_pub_.publish(debug_msg.toImageMsg());
+        }
 
-      // publish input image with markers drawn on it
-      if (publishImage)
-      {
-        // show input with augmented information
-        cv_bridge::CvImage out_msg;
-        out_msg.header.stamp = curr_stamp;
-        out_msg.encoding = sensor_msgs::image_encodings::RGB8;
-        out_msg.image = inImage_;
-        image_pub_.publish(out_msg.toImageMsg());
-      }
+        // publish drone's position with respect to the marker
+        if (publishPosition && markers_.size() > 0)
+        {
+            tf::StampedTransform cameraToMarker;
+            if (getTransform("realsense_frame", "marker_frame", cameraToMarker))
+            {
+                // Transform the marker pose from marker frame to camera frame
+                tf::Pose markerPoseInCameraFrame = aruco_ros::arucoMarker2Tf(markers_[0]);
+                markerPoseInCameraFrame = static_cast<tf::Transform>(cameraToMarker) * markerPoseInCameraFrame;
 
-      // publish image after internal image processing
-      if (publishDebug)
-      {
-        // show also the internal image resulting from the threshold operation
-        cv_bridge::CvImage debug_msg;
-        debug_msg.header.stamp = curr_stamp;
-        debug_msg.encoding = sensor_msgs::image_encodings::MONO8;
-        debug_msg.image = mDetector_.getThresholdedImage();
-        debug_pub_.publish(debug_msg.toImageMsg());
-      }
+                // Transform the marker pose from camera frame to global frame (map)
+                tf::StampedTransform cameraToMap;
+                if (getTransform("map", "realsense_frame", cameraToMap))
+                {
+                    tf::Pose markerPoseInMapFrame = static_cast<tf::Transform>(cameraToMap) * markerPoseInCameraFrame;
 
+                    // Create and publish the PoseStamped message
+                    geometry_msgs::PoseStamped positionMsg;
+                    positionMsg.header.stamp = curr_stamp;
+                    positionMsg.header.frame_id = "map";
+                    tf::poseTFToMsg(markerPoseInMapFrame, positionMsg.pose);
+
+                    position_pub_.publish(positionMsg);
+                }
+            }
+        }
     }
     catch (cv_bridge::Exception& e)
     {
-      ROS_ERROR("cv_bridge exception: %s", e.what());
+        ROS_ERROR("cv_bridge exception: %s", e.what());
     }
-  }
+}
 };
 
 int main(int argc, char **argv)
